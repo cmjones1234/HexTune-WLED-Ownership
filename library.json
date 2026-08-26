@@ -1,0 +1,19 @@
+{
+  "name": "HexTune-WLED-Ownership",
+  "version": "1.0.0",
+  "description": "HexTune D1/S3 physical WS2812B ownership control",
+  "keywords": [
+    "wled",
+    "usermod",
+    "hextune",
+    "esp32",
+    "ownership"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cmjones1234/HexTune-WLED-Ownership.git"
+  },
+  "build": {
+    "libArchive": false
+  }
+}
