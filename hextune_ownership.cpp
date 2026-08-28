@@ -1,4 +1,3 @@
-```cpp
 /******************************************************************************
  *
  * Project      : HexTune
@@ -261,4 +260,3 @@ static HexTuneOwnership hexTuneOwnership;
 
 REGISTER_USERMOD(
     hexTuneOwnership);
-```
