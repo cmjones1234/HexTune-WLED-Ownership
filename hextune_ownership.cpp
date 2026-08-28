@@ -1,3 +1,4 @@
+```cpp
 /******************************************************************************
  *
  * Project      : HexTune
@@ -29,8 +30,7 @@
 #include "bus_manager.h"
 
 
-class HexTuneOwnership
-    : public Usermod
+class HexTuneOwnership : public Usermod
 {
 public:
 
@@ -38,22 +38,15 @@ public:
     // Configuration
     ///////////////////////////////////////////////////////////////////////////
 
-    static constexpr uint8_t OWNER_INPUT_PIN =
-        8U;
-
-    static constexpr uint8_t WLED_DATA_PIN =
-        5U;
+    static constexpr uint8_t OWNER_INPUT_PIN = 8U;
 
 
     ///////////////////////////////////////////////////////////////////////////
     // State
     ///////////////////////////////////////////////////////////////////////////
 
-    bool m_initialized =
-        false;
-
-    bool m_lastRemoteOwnership =
-        false;
+    bool m_initialized = false;
+    bool m_lastRemoteOwnership = false;
 
 
     ///////////////////////////////////////////////////////////////////////////
@@ -63,8 +56,14 @@ public:
     void setup() override
     {
         /*
-         * Internal pulldown provides a deterministic LOCAL/D1 state while
-         * the D1 is booting and before GPIO23 has been initialized.
+         * GPIO8 is driven by D1 GPIO23.
+         *
+         * The pulldown establishes the safe default:
+         *
+         *     LOW = D1 owns LEDs
+         *
+         * This also prevents the S3 from briefly assuming ownership while
+         * the D1 is still booting.
          */
         pinMode(
             OWNER_INPUT_PIN,
@@ -72,9 +71,7 @@ public:
 
 
         const bool remoteOwnership =
-            digitalRead(
-                OWNER_INPUT_PIN) ==
-            HIGH;
+            digitalRead(OWNER_INPUT_PIN) == HIGH;
 
 
         m_lastRemoteOwnership =
@@ -86,11 +83,10 @@ public:
 
 
         /*
-         * The desired boot state is LOCAL/D1 whenever GPIO8 is LOW.
+         * WLED has already created its normal LED buses by the time Usermod
+         * setup() executes.
          *
-         * WLED has already initialized its normal LED bus before Usermod
-         * setup() is called, so explicitly release it here when D1 owns
-         * the strip.
+         * If D1 owns the strip at startup, release WLED's buses now.
          */
         applyOwnership(
             remoteOwnership);
@@ -110,9 +106,7 @@ public:
 
 
         const bool remoteOwnership =
-            digitalRead(
-                OWNER_INPUT_PIN) ==
-            HIGH;
+            digitalRead(OWNER_INPUT_PIN) == HIGH;
 
 
         if (remoteOwnership ==
@@ -131,86 +125,91 @@ public:
     }
 
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Apply Ownership
-    ///////////////////////////////////////////////////////////////////////////
-
 private:
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Ownership State Machine
+    ///////////////////////////////////////////////////////////////////////////
 
     void applyOwnership(
         bool remoteOwnership)
     {
-        ///////////////////////////////////////////////////////////////////////////
-        // D1 / LOCAL
-        ///////////////////////////////////////////////////////////////////////////
-
-        if (!remoteOwnership)
+        if (remoteOwnership)
         {
-            releaseWLED();
+            /*
+             * GPIO8 HIGH:
+             *
+             * S3/WLED owns the physical LED strip.
+             */
+            acquireWLED();
 
             return;
         }
 
 
-        ///////////////////////////////////////////////////////////////////////////
-        // S3 / REMOTE
-        ///////////////////////////////////////////////////////////////////////////
-
-        restoreWLED();
+        /*
+         * GPIO8 LOW:
+         *
+         * D1 owns the physical LED strip.
+         */
+        releaseWLED();
     }
 
 
     ///////////////////////////////////////////////////////////////////////////
-    // Release WLED Physical Output
+    // Release WLED Bus
     ///////////////////////////////////////////////////////////////////////////
 
     void releaseWLED()
     {
         /*
-         * Turn WLED output off before destroying the physical bus.
+         * Stop WLED from producing LED data before releasing the buses.
+         *
+         * BusManager::off() changes the WLED output state without destroying
+         * the WS2812FX object or its segment/preset state.
          */
         BusManager::off();
 
 
         /*
-         * Destroy the active WLED LED buses.
+         * Release the physical LED buses.
          *
-         * BusDigital::cleanup() releases the WLED ownership of GPIO5 and
-         * shuts down the underlying RMT/I2S transport.
+         * This is the important operation. BusManager owns the underlying
+         * digital LED driver resources and GPIO allocation.
+         *
+         * DO NOT destroy/reconstruct 'strip'.
          */
         BusManager::removeAll();
-
-
-        /*
-         * Explicitly place GPIO5 in high impedance state.
-         *
-         * This is the critical handoff point:
-         *
-         *     GPIO5 = INPUT
-         *     D1 GPIO4 = sole WS2812B driver
-         */
-        pinMode(
-            WLED_DATA_PIN,
-            INPUT);
     }
 
 
     ///////////////////////////////////////////////////////////////////////////
-    // Restore WLED Physical Output
+    // Acquire WLED Bus
     ///////////////////////////////////////////////////////////////////////////
 
-    void restoreWLED()
+    void acquireWLED()
     {
         /*
-         * Recreate the LED buses from the saved WLED configuration.
+         * Preserve WLED's existing segment configuration before rebuilding
+         * the physical bus.
          */
         const bool aligned =
             strip.checkSegmentAlignment();
 
 
+        /*
+         * Recreate the LED buses from WLED's existing bus configuration.
+         *
+         * This is the same fundamental operation WLED performs when its
+         * normal bus reinitialization path executes.
+         */
         strip.finalizeInit();
 
 
+        /*
+         * Restore segment mapping exactly as WLED does after bus
+         * reinitialization.
+         */
         if (aligned)
         {
             strip.makeAutoSegments();
@@ -222,28 +221,24 @@ private:
 
 
         /*
-         * Restore the configured global brightness.
+         * Restore WLED's configured brightness to the newly created buses.
          */
         BusManager::setBrightness(
-            strip.getBrightness());
+            scaledBri(bri));
 
 
         /*
-         * Explicitly restore GPIO5 as an output.
+         * Request a fresh frame.
          *
-         * finalizeInit() recreates the WLED bus and its driver allocation,
-         * but this guarantees the Arduino GPIO mode is correct before the
-         * next WLED frame.
-         */
-        pinMode(
-            WLED_DATA_PIN,
-            OUTPUT);
-
-
-        /*
-         * Force a frame immediately.
+         * Do not manually configure the LED GPIO here. The WLED bus driver
+         * owns and initializes the GPIO as part of finalizeInit().
          */
         strip.trigger();
+
+
+        /*
+         * Send the current frame immediately.
+         */
         strip.show();
     }
 
@@ -254,16 +249,16 @@ private:
 
 public:
 
-    uint16_t getId()
+    uint16_t getId() override
     {
         return USERMOD_ID_UNSPECIFIED;
     }
 };
 
 
-static HexTuneOwnership
-    hexTuneOwnership;
+static HexTuneOwnership hexTuneOwnership;
 
 
 REGISTER_USERMOD(
     hexTuneOwnership);
+```
