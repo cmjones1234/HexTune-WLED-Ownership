@@ -14,28 +14,20 @@
 * D1 GPIO23 -> S3 GPIO8
 *
 * GPIO8 LOW:
-* ```
-  D1 owns the physical WS2812B strip.
-  ```
-* ```
-  WLED releases its physical LED buses.
-  ```
+* 
+* D1 owns the physical WS2812B strip.
+*
+* WLED releases its physical LED buses.
 *
 * GPIO8 HIGH:
-* ```
-  S3/WLED owns the physical WS2812B strip.
-  ```
-* ```
-  WLED restores its previously active LED bus configuration.
-  ```
+* S3/WLED owns the physical WS2812B strip.
+* WLED restores its previously active LED bus configuration.
 *
 * WLED LED DATA:
-* ```
-  Determined by WLED LED Preferences.
-  ```
+* Determined by WLED LED Preferences.
 *
 * Design
-* ---
+* 
 * The active WLED BusConfig is captured before the physical bus is released.
 *
 * The BusConfig is retained by this Usermod while D1 owns the physical strip.
@@ -157,11 +149,11 @@ void loop() override
     applyOwnership(
         remoteOwnership);
 }
-```
+
 
 private:
 
-```
+
 ///////////////////////////////////////////////////////////////////////////
 // Ownership State Machine
 ///////////////////////////////////////////////////////////////////////////
