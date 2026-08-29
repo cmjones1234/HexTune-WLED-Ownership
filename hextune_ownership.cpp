@@ -14,28 +14,20 @@
  *
  * GPIO8 LOW:
  *     D1 owns the physical WS2812B strip.
- *     WLED releases its physical LED buses.
+ *     WLED releases its physical LED bus.
  *
  * GPIO8 HIGH:
  *     S3/WLED owns the physical WS2812B strip.
- *     WLED restores the previously active LED bus configuration.
+ *     WLED restores its configured physical LED bus.
  *
- * WLED LED DATA:
- *     Determined by WLED LED Preferences.
+ * WLED hardware defaults are supplied by HexTune-WLED-Build:
  *
- * Design
- * ---------------------------------------------------------------------------
- * The active WLED bus configuration is captured immediately before WLED
- * releases its physical buses.
+ *     DATA_PINS    = 5
+ *     PIXEL_COUNTS = 7
+ *     LED_TYPES    = TYPE_WS2812_RGB
  *
- * The complete configuration of every active WLED bus is retained by this
- * Usermod while D1 owns the physical strip.
- *
- * When S3/WLED ownership returns, the saved BusConfig objects are restored
- * to WLED's temporary bus configuration list and WLED's native deferred bus
- * initialization mechanism is requested.
- *
- * No LED count or data GPIO is hard-coded here.
+ * WLED remains responsible for persistent LED configuration.
+ * This UserMod is responsible only for physical ownership handoff.
  *
  ******************************************************************************/
 
@@ -55,6 +47,53 @@ public:
 
 
     ///////////////////////////////////////////////////////////////////////////
+    // Saved Bus Record
+    //
+    // We intentionally do NOT store BusConfig objects directly.
+    // BusConfig has no default constructor in this WLED build.
+    ///////////////////////////////////////////////////////////////////////////
+
+    struct SavedBus
+    {
+        uint8_t type = TYPE_WS2812_RGB;
+
+        uint8_t pins[OUTPUT_MAX_PINS] =
+        {
+            255,
+            255,
+            255,
+            255,
+            255
+        };
+
+        uint16_t start = 0U;
+
+        uint16_t length = 0U;
+
+        uint8_t colorOrder = COL_ORDER_GRB;
+
+        bool reversed = false;
+
+        uint8_t skip = 0U;
+
+        uint8_t autoWhiteMode =
+            RGBW_MODE_MANUAL_ONLY;
+
+        uint16_t frequency = 0U;
+
+        uint8_t ledCurrent =
+            LED_MILLIAMPS_DEFAULT;
+
+        uint16_t maxCurrent =
+            ABL_MILLIAMPS_DEFAULT;
+
+        uint8_t driver = 0U;
+
+        String customText;
+    };
+
+
+    ///////////////////////////////////////////////////////////////////////////
     // State
     ///////////////////////////////////////////////////////////////////////////
 
@@ -62,7 +101,7 @@ public:
 
     bool m_lastRemoteOwnership = false;
 
-    std::vector<BusConfig> m_savedBusConfigs;
+    std::vector<SavedBus> m_savedBuses;
 
 
     ///////////////////////////////////////////////////////////////////////////
@@ -72,13 +111,12 @@ public:
     void setup() override
     {
         /*
-         * GPIO8 is driven by D1 GPIO23.
+         * D1 GPIO23 drives S3 GPIO8.
          *
-         * LOW  = D1 owns the physical LED strip.
-         * HIGH = S3/WLED owns the physical LED strip.
+         * LOW  = D1 owns the strip.
+         * HIGH = S3/WLED owns the strip.
          *
-         * Pulldown provides the safe D1 ownership state while the D1 is
-         * booting and before GPIO23 has been configured.
+         * INPUT_PULLDOWN provides the safe D1 ownership state during boot.
          */
         pinMode(
             OWNER_INPUT_PIN,
@@ -86,12 +124,15 @@ public:
 
 
         const bool remoteOwnership =
-            digitalRead(OWNER_INPUT_PIN) == HIGH;
+            digitalRead(
+                OWNER_INPUT_PIN) == HIGH;
 
 
         /*
-         * Capture the currently active WLED bus configuration before any
-         * ownership transition can release the physical buses.
+         * WLED has already loaded its persistent configuration and created
+         * its normal LED buses before Usermod setup() executes.
+         *
+         * Capture that configuration before changing physical ownership.
          */
         saveBusConfiguration();
 
@@ -105,13 +146,14 @@ public:
 
 
         /*
-         * WLED has already initialized its normal LED buses by the time
-         * Usermod setup() executes.
+         * Apply the ownership state established by D1.
          *
-         * If D1 owns the strip at boot, release WLED's physical buses now.
+         * If GPIO8 is LOW, WLED releases its physical bus immediately.
          */
-        applyOwnership(
-            remoteOwnership);
+        if (!remoteOwnership)
+        {
+            releaseWLED();
+        }
     }
 
 
@@ -128,9 +170,13 @@ public:
 
 
         const bool remoteOwnership =
-            digitalRead(OWNER_INPUT_PIN) == HIGH;
+            digitalRead(
+                OWNER_INPUT_PIN) == HIGH;
 
 
+        /*
+         * Nothing changed.
+         */
         if (remoteOwnership ==
             m_lastRemoteOwnership)
         {
@@ -138,60 +184,56 @@ public:
         }
 
 
+        /*
+         * Record the new ownership state before performing the transition.
+         */
         m_lastRemoteOwnership =
             remoteOwnership;
 
 
-        applyOwnership(
-            remoteOwnership);
+        if (remoteOwnership)
+        {
+            acquireWLED();
+        }
+        else
+        {
+            releaseWLED();
+        }
     }
 
 
 private:
 
     ///////////////////////////////////////////////////////////////////////////
-    // Ownership State Machine
-    ///////////////////////////////////////////////////////////////////////////
-
-    void applyOwnership(
-        bool remoteOwnership)
-    {
-        if (remoteOwnership)
-        {
-            acquireWLED();
-
-            return;
-        }
-
-
-        releaseWLED();
-    }
-
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Save WLED Bus Configuration
+    // Save Current WLED Bus Configuration
     ///////////////////////////////////////////////////////////////////////////
 
     void saveBusConfiguration()
     {
-        /*
-         * Rebuild the saved configuration from the currently active WLED
-         * buses. This allows future changes to LED count, GPIO, driver,
-         * color order, and other bus settings to be retained.
-         */
-        m_savedBusConfigs.clear();
+        m_savedBuses.clear();
 
 
         const size_t busCount =
             BusManager::getNumBusses();
 
 
-        for (size_t i = 0;
-             i < busCount;
-             ++i)
+        if (busCount == 0U)
+        {
+            return;
+        }
+
+
+        m_savedBuses.reserve(
+            busCount);
+
+
+        for (size_t index = 0U;
+             index < busCount;
+             ++index)
         {
             Bus* bus =
-                BusManager::getBus(i);
+                BusManager::getBus(
+                    index);
 
 
             if (bus == nullptr)
@@ -200,122 +242,174 @@ private:
             }
 
 
-            uint8_t pins[OUTPUT_MAX_PINS] =
-            {
-                255,
-                255,
-                255,
-                255,
-                255
-            };
+            SavedBus saved;
 
 
-            bus->getPins(
-                pins);
-
-
-            uint8_t busType =
+            saved.type =
                 bus->getType();
 
 
+            bus->getPins(
+                saved.pins);
+
+
+            saved.start =
+                bus->getStart();
+
+
+            saved.length =
+                bus->getLength();
+
+
+            saved.colorOrder =
+                bus->getColorOrder();
+
+
+            saved.reversed =
+                bus->isReversed();
+
+
+            saved.skip =
+                static_cast<uint8_t>(
+                    bus->skippedLeds());
+
+
+            saved.autoWhiteMode =
+                bus->getAutoWhiteMode();
+
+
+            saved.frequency =
+                bus->getFrequency();
+
+
+            saved.ledCurrent =
+                static_cast<uint8_t>(
+                    bus->getLEDCurrent());
+
+
+            saved.maxCurrent =
+                bus->getMaxCurrent();
+
+
+            saved.driver =
+                bus->getDriverType();
+
+
+            saved.customText =
+                bus->getCustomText();
+
+
+            /*
+             * BusConfig uses bit 7 to represent the off-refresh flag.
+             *
+             * Preserve it when reconstructing the configuration.
+             */
             if (bus->isOffRefreshRequired())
             {
-                busType |= 0x80U;
+                saved.type |= 0x80U;
             }
 
 
-            m_savedBusConfigs.emplace_back(
-                busType,
-                pins,
-                bus->getStart(),
-                bus->getLength(),
-                bus->getColorOrder(),
-                bus->isReversed(),
-                static_cast<uint8_t>(
-                    bus->skippedLeds()),
-                bus->getAutoWhiteMode(),
-                bus->getFrequency(),
-                static_cast<uint8_t>(
-                    bus->getLEDCurrent()),
-                bus->getMaxCurrent(),
-                bus->getDriverType(),
-                bus->getCustomText());
+            m_savedBuses.push_back(
+                saved);
         }
     }
 
 
     ///////////////////////////////////////////////////////////////////////////
-    // Release WLED Physical Buses
+    // Release WLED Physical Bus
     ///////////////////////////////////////////////////////////////////////////
 
     void releaseWLED()
     {
         /*
-         * Capture the current runtime configuration immediately before
-         * releasing the buses.
+         * Always capture the current WLED configuration immediately before
+         * releasing the bus.
+         *
+         * This means changes made through the WLED LED Preferences page are
+         * retained for the next ownership transition.
          */
         saveBusConfiguration();
 
 
-        /*
-         * Make certain WLED is not actively driving the strip while D1 owns
-         * the physical data line.
-         */
-        BusManager::off();
-
-
-        /*
-         * Release WLED's physical bus resources.
-         *
-         * The saved BusConfig objects remain in this Usermod.
-         */
-        BusManager::removeAll();
-    }
-
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Acquire WLED Physical Buses
-    ///////////////////////////////////////////////////////////////////////////
-
-    void acquireWLED()
-    {
-        /*
-         * Do not invent an LED count, GPIO, or other configuration.
-         *
-         * If no valid WLED bus was captured, leave WLED unchanged.
-         */
-        if (m_savedBusConfigs.empty())
+        if (m_savedBuses.empty())
         {
             return;
         }
 
 
         /*
-         * WLED uses busConfigs as a temporary configuration list consumed
-         * by its normal deferred bus initialization path.
+         * Stop WLED output before releasing the physical bus.
          */
-        busConfigs.clear();
+        BusManager::off();
 
 
-        for (const BusConfig& savedConfig :
-             m_savedBusConfigs)
+        /*
+         * WLED's BusDigital cleanup releases its GPIO ownership and driver
+         * resources.
+         */
+        BusManager::removeAll();
+    }
+
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Restore WLED Physical Bus
+    ///////////////////////////////////////////////////////////////////////////
+
+    void acquireWLED()
+    {
+        if (m_savedBuses.empty())
         {
-            busConfigs.push_back(
-                savedConfig);
+            return;
         }
 
 
         /*
-         * Request WLED's native deferred bus initialization.
+         * Reconstruct WLED's temporary BusConfig list.
          *
-         * The WLED main loop will recreate the physical buses from the
-         * restored BusConfig objects.
+         * WLED's main loop will process doInitBusses and call:
+         *
+         *     strip.finalizeInit()
+         *
+         * which recreates the physical LED buses.
          */
-        doInitBusses = true;
+        busConfigs.clear();
+
+
+        for (const SavedBus& saved :
+             m_savedBuses)
+        {
+            BusConfig config(
+                saved.type,
+                const_cast<uint8_t*>(
+                    saved.pins),
+                saved.start,
+                saved.length,
+                saved.colorOrder,
+                saved.reversed,
+                saved.skip,
+                saved.autoWhiteMode,
+                saved.frequency,
+                saved.ledCurrent,
+                saved.maxCurrent,
+                saved.driver,
+                saved.customText);
+
+
+            busConfigs.push_back(
+                config);
+        }
 
 
         /*
-         * Request a fresh frame after the bus has been recreated.
+         * Ask WLED to perform its native bus reinitialization.
+         */
+        doInitBusses =
+            true;
+
+
+        /*
+         * Request a fresh frame once the bus is restored.
          */
         strip.trigger();
     }
