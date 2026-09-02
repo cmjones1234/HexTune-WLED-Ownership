@@ -4,51 +4,42 @@
  *
  * Module       : hextune_ownership.cpp
  *
- * Revision     : R0003
- *
  * Description
  * ---------------------------------------------------------------------------
  * HexTune physical WS2812B ownership Usermod for WLED.
  *
  * Hardware Contract
  * ---------------------------------------------------------------------------
+ * D1 GPIO23 -> S3 GPIO8
  *
- *     D1 GPIO23 -> S3 GPIO8
+ * GPIO8 LOW:
+ *     D1 owns the physical WS2812B strip.
+ *     WLED stops servicing the LED strip and forces it OFF.
  *
- *     GPIO8 LOW:
- *         D1 owns the physical WS2812B strip.
- *         S3/WLED releases GPIO5 electrically.
+ * GPIO8 HIGH:
+ *     S3/WLED owns the physical WS2812B strip.
+ *     WLED resumes its existing configured LED bus.
  *
- *     GPIO8 HIGH:
- *         S3/WLED owns the physical WS2812B strip.
- *         S3/WLED drives GPIO5.
+ * WLED LED DATA:
+ *     GPIO5
  *
- *     WLED LED DATA:
- *         GPIO5
- *
- * Ownership Model
+ * Important
  * ---------------------------------------------------------------------------
+ * This Usermod deliberately does NOT remove WLED buses.
  *
- *     The WLED LED bus is NEVER removed or reconstructed.
+ * Removing buses caused WLED's configured LED bus state to disappear and
+ * allowed a zero-bus configuration to be persisted. That produced the
+ * observed "0 LEDs / no GPIO after reboot" behavior and made the restored
+ * output unreliable.
  *
- *     LOCAL / D1:
- *         strip.suspend()
- *         BusManager::off()
- *         GPIO5 = INPUT / HIGH-Z
- *
- *     REMOTE / S3:
- *         GPIO5 = OUTPUT
- *         strip.resume()
- *         strip.trigger()
- *
- * This preserves WLED's configured LED bus and prevents the previous
- * zero-LED / missing-GPIO configuration problem.
+ * Instead, WLED's existing bus remains configured at all times. When D1 owns
+ * the physical strip, the WLED strip service is suspended and the buses are
+ * forced OFF. When ownership returns, the strip is resumed and a fresh frame
+ * is triggered.
  *
  ******************************************************************************/
 
 #include <new>
-
-#include <Arduino.h>
 
 #include "wled.h"
 #include "bus_manager.h"
@@ -58,53 +49,28 @@ class HexTuneOwnership : public Usermod
 {
 public:
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Hardware
-    ///////////////////////////////////////////////////////////////////////////
+    static constexpr uint8_t OWNER_INPUT_PIN = 8U;
 
-    static constexpr uint8_t OWNER_INPUT_PIN =
-        8U;
+    bool m_initialized = false;
+    bool m_lastRemoteOwnership = false;
 
-    static constexpr uint8_t WLED_DATA_PIN =
-        5U;
-
-
-    ///////////////////////////////////////////////////////////////////////////
-    // State
-    ///////////////////////////////////////////////////////////////////////////
-
-    bool
-        m_initialized =
-            false;
-
-    bool
-        m_lastRemoteOwnership =
-            false;
-
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Setup
-    ///////////////////////////////////////////////////////////////////////////
 
     void setup() override
     {
-        ///////////////////////////////////////////////////////////////////////////
-        // Ownership Input
-        ///////////////////////////////////////////////////////////////////////////
-
+        /*
+         * GPIO8 is driven by D1 GPIO23.
+         *
+         * LOW  = D1 owns the strip.
+         * HIGH = S3/WLED owns the strip.
+         *
+         * Pulldown makes D1 ownership the safe boot state.
+         */
         pinMode(
             OWNER_INPUT_PIN,
             INPUT_PULLDOWN);
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Read Initial Ownership
-        ///////////////////////////////////////////////////////////////////////////
-
         const bool remoteOwnership =
-            digitalRead(
-                OWNER_INPUT_PIN) == HIGH;
-
+            digitalRead(OWNER_INPUT_PIN) == HIGH;
 
         m_lastRemoteOwnership =
             remoteOwnership;
@@ -112,19 +78,10 @@ public:
         m_initialized =
             true;
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Apply Initial Ownership
-        ///////////////////////////////////////////////////////////////////////////
-
         applyOwnership(
             remoteOwnership);
     }
 
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Main Loop
-    ///////////////////////////////////////////////////////////////////////////
 
     void loop() override
     {
@@ -133,60 +90,24 @@ public:
             return;
         }
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Read Ownership Signal
-        ///////////////////////////////////////////////////////////////////////////
-
         const bool remoteOwnership =
-            digitalRead(
-                OWNER_INPUT_PIN) == HIGH;
+            digitalRead(OWNER_INPUT_PIN) == HIGH;
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Ownership Change
-        ///////////////////////////////////////////////////////////////////////////
-
-        if (remoteOwnership !=
+        if (remoteOwnership ==
             m_lastRemoteOwnership)
         {
-            m_lastRemoteOwnership =
-                remoteOwnership;
-
-
-            applyOwnership(
-                remoteOwnership);
-
-
             return;
         }
 
+        m_lastRemoteOwnership =
+            remoteOwnership;
 
-        ///////////////////////////////////////////////////////////////////////////
-        // Maintain HIGH-Z While D1 Owns the Strip
-        ///////////////////////////////////////////////////////////////////////////
-
-        /*
-         * WLED can reinitialize its LED bus after certain configuration
-         * operations. When D1 owns the physical strip, GPIO5 must remain
-         * electrically released.
-         *
-         * Reassert INPUT only while local ownership is active.
-         */
-        if (!remoteOwnership)
-        {
-            pinMode(
-                WLED_DATA_PIN,
-                INPUT);
-        }
+        applyOwnership(
+            remoteOwnership);
     }
 
 
 private:
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Apply Ownership
-    ///////////////////////////////////////////////////////////////////////////
 
     void applyOwnership(
         bool remoteOwnership)
@@ -202,100 +123,48 @@ private:
     }
 
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Release WLED / D1 Owns Strip
-    ///////////////////////////////////////////////////////////////////////////
-
     void releaseWLED()
     {
-        ///////////////////////////////////////////////////////////////////////////
-        // Stop WLED Strip Service
-        ///////////////////////////////////////////////////////////////////////////
-
+        /*
+         * Stop the effect/service engine first so WLED cannot immediately
+         * repaint the strip after it has been handed to the D1.
+         */
         strip.suspend();
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Force WLED Bus State OFF
-        ///////////////////////////////////////////////////////////////////////////
-
         /*
-         * This does NOT remove the configured bus.
+         * Force all configured WLED buses OFF.
+         *
+         * The buses themselves remain allocated and configured, so WLED's
+         * persisted LED settings are never destroyed.
          */
         BusManager::off();
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Electrically Release GPIO5
-        ///////////////////////////////////////////////////////////////////////////
-
-        /*
-         * This is the critical S3-side ownership change.
-         *
-         * WLED's RMT/I2S bus remains allocated and configured, but the ESP32
-         * GPIO output driver is disabled so it cannot electrically contend
-         * with D1 GPIO4.
-         */
-        pinMode(
-            WLED_DATA_PIN,
-            INPUT);
-
-
 #if defined(HT_DEBUG_SERIAL)
-
-        DEBUG_PRINTLN(
-            F("HexTune: S3 WLED released; D1 owns LED DATA."));
-
+        DEBUG_PRINTLN(F("HexTune: WLED strip suspended; D1 owns LEDs."));
 #endif
     }
 
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Acquire WLED / S3 Owns Strip
-    ///////////////////////////////////////////////////////////////////////////
-
     void acquireWLED()
     {
-        ///////////////////////////////////////////////////////////////////////////
-        // Claim GPIO5
-        ///////////////////////////////////////////////////////////////////////////
-
         /*
-         * D1 has already released GPIO4 before GPIO8 is asserted HIGH.
+         * Resume the same WLED bus configuration that was initialized at
+         * startup. No BusConfig reconstruction is necessary.
          */
-        pinMode(
-            WLED_DATA_PIN,
-            OUTPUT);
-
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Resume WLED Strip Service
-        ///////////////////////////////////////////////////////////////////////////
-
         strip.resume();
 
-
-        ///////////////////////////////////////////////////////////////////////////
-        // Force First WLED Frame
-        ///////////////////////////////////////////////////////////////////////////
-
+        /*
+         * Force the first frame after ownership return.
+         */
         strip.trigger();
 
-
 #if defined(HT_DEBUG_SERIAL)
-
-        DEBUG_PRINTLN(
-            F("HexTune: S3 WLED acquired; S3 owns LED DATA."));
-
+        DEBUG_PRINTLN(F("HexTune: WLED strip resumed; S3 owns LEDs."));
 #endif
     }
 
 
 public:
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Usermod ID
-    ///////////////////////////////////////////////////////////////////////////
 
     uint16_t getId() override
     {
@@ -304,12 +173,7 @@ public:
 };
 
 
-///////////////////////////////////////////////////////////////////////////////
-// Global Usermod Instance
-///////////////////////////////////////////////////////////////////////////////
-
-static HexTuneOwnership
-    hexTuneOwnership;
+static HexTuneOwnership hexTuneOwnership;
 
 
 REGISTER_USERMOD(
